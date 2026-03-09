@@ -248,6 +248,7 @@ class RecorderThread(QThread):
         preview_interval = 1.0 / 10.0
         last_preview_time = 0.0
         last_status_time = 0.0
+        frames_written = 0
 
         with mss.mss() as sct:
             monitor = sct.monitors[self.monitor_index + 1]
@@ -277,17 +278,25 @@ class RecorderThread(QThread):
                             cy = int(self.webcam_pos[1] * h)
                             _composite_webcam(frame_bgr, cam_frame, cx, cy, diameter)
 
-                    writer.write(frame_bgr)
-
+                    # Write enough copies of the frame to keep video in sync
+                    # with real time.  When capture is slower than target fps,
+                    # duplicating the frame prevents the video from playing
+                    # faster than real-time.
                     now = time.monotonic()
+                    elapsed = now - start_time
+                    target_frames = int(elapsed * self.fps) + 1
+                    repeat = max(1, target_frames - frames_written)
+                    for _ in range(repeat):
+                        writer.write(frame_bgr)
+                    frames_written += repeat
 
                     if (now - last_preview_time) >= preview_interval:
                         self.preview_frame_ready.emit(frame_bgr.copy())
                         last_preview_time = now
 
                     if (now - last_status_time) >= 1.0:
-                        elapsed = int(now - start_time)
-                        mins, secs = divmod(elapsed, 60)
+                        secs_elapsed = int(elapsed)
+                        mins, secs = divmod(secs_elapsed, 60)
                         self.status_update.emit(f"Recording... {mins:02d}:{secs:02d}")
                         last_status_time = now
 
