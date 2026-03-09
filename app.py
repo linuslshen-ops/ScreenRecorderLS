@@ -9,8 +9,8 @@ import mss
 import numpy as np
 import soundcard
 import sounddevice as sd
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import Qt, QTimer, QPoint
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QPainterPath, QColor, QPen
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -29,12 +29,107 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from recorder import RecorderThread
+from recorder import RecorderThread, WebcamCapture
 
 
 PREVIEW_W = 640
 PREVIEW_H = 360
+WEBCAM_OVERLAY_SIZE = 120   # pixels in the preview
 
+
+# --------------------------------------------------------------------------- #
+#  Draggable circular webcam overlay widget                                    #
+# --------------------------------------------------------------------------- #
+
+class DraggableOverlay(QWidget):
+    """Circular webcam preview that can be dragged inside the preview area."""
+
+    def __init__(self, parent=None, size=WEBCAM_OVERLAY_SIZE):
+        super().__init__(parent)
+        self._size = size
+        self._pixmap = None
+        self._drag_offset = None
+        self.setFixedSize(size, size)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.hide()
+
+    # -- public API -------------------------------------------------------- #
+
+    def set_frame(self, frame_bgr):
+        """Display a BGR numpy frame as a circular thumbnail."""
+        if frame_bgr is None:
+            return
+        h, w = frame_bgr.shape[:2]
+        side = min(h, w)
+        cy, cx = h // 2, w // 2
+        crop = frame_bgr[cy - side // 2:cy + side // 2,
+                         cx - side // 2:cx + side // 2]
+        resized = cv2.resize(crop, (self._size, self._size))
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).copy()
+        img = QImage(rgb.data, self._size, self._size,
+                     self._size * 3, QImage.Format.Format_RGB888)
+        self._pixmap = QPixmap.fromImage(img.copy())
+        self.update()
+
+    def normalised_centre(self):
+        """Return the overlay centre as (0-1, 0-1) fraction of the parent size."""
+        parent = self.parentWidget()
+        if not parent:
+            return (0.8, 0.8)
+        cx = (self.x() + self._size / 2) / parent.width()
+        cy = (self.y() + self._size / 2) / parent.height()
+        return (max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy)))
+
+    def place_default(self):
+        """Move to the bottom-right quadrant of the parent."""
+        parent = self.parentWidget()
+        if parent:
+            x = parent.width() - self._size - 16
+            y = parent.height() - self._size - 16
+            self.move(max(0, x), max(0, y))
+
+    # -- painting ---------------------------------------------------------- #
+
+    def paintEvent(self, event):
+        if not self._pixmap:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Clip to circle
+        path = QPainterPath()
+        path.addEllipse(3.0, 3.0, self._size - 6.0, self._size - 6.0)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, self._pixmap)
+        painter.setClipping(False)
+        # White border
+        painter.setPen(QPen(QColor(255, 255, 255), 3))
+        painter.drawEllipse(3, 3, self._size - 6, self._size - 6)
+        painter.end()
+
+    # -- dragging ---------------------------------------------------------- #
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None:
+            new_pos = self.mapToParent(event.position().toPoint() - self._drag_offset)
+            parent = self.parentWidget()
+            x = max(0, min(new_pos.x(), parent.width() - self.width()))
+            y = max(0, min(new_pos.y(), parent.height() - self.height()))
+            self.move(x, y)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+
+# --------------------------------------------------------------------------- #
+#  Main window                                                                 #
+# --------------------------------------------------------------------------- #
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -45,15 +140,17 @@ class MainWindow(QMainWindow):
         self._recorder_thread = None
         self._is_recording = False
         self._output_folder = os.path.expanduser("~\\Videos")
+        self._webcam_capture = None
 
         self._build_ui()
         self._populate_monitors()
         self._populate_system_audio_devices()
         self._populate_mic_devices()
+        self._populate_cameras()
 
         # Start idle preview timer
         self._preview_timer = QTimer(self)
-        self._preview_timer.setInterval(100)  # 10 fps
+        self._preview_timer.setInterval(100)  # ~10 fps
         self._preview_timer.timeout.connect(self._update_idle_preview)
         self._preview_timer.start()
 
@@ -121,6 +218,16 @@ class MainWindow(QMainWindow):
         mic_row.addWidget(self.mic_combo, stretch=1)
         form.addRow("Microphone:", mic_row)
 
+        # Webcam
+        cam_row = QHBoxLayout()
+        self.cam_check = QCheckBox("Enable")
+        self.cam_combo = QComboBox()
+        self.cam_combo.setEnabled(False)
+        self.cam_check.toggled.connect(self._on_webcam_toggled)
+        cam_row.addWidget(self.cam_check)
+        cam_row.addWidget(self.cam_combo, stretch=1)
+        form.addRow("Webcam:", cam_row)
+
         return group
 
     def _build_preview_group(self):
@@ -131,6 +238,11 @@ class MainWindow(QMainWindow):
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setStyleSheet("background-color: #1a1a1a;")
         vbox.addWidget(self.preview_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        # Draggable webcam overlay (child of preview_label)
+        self.webcam_overlay = DraggableOverlay(self.preview_label)
+        self.webcam_overlay.place_default()
+
         return group
 
     def _build_controls_layout(self):
@@ -174,7 +286,6 @@ class MainWindow(QMainWindow):
             speakers = soundcard.all_speakers()
             for sp in speakers:
                 self.sys_audio_combo.addItem(sp.name, userData=sp.name)
-            # Default to the default speaker
             default = soundcard.default_speaker()
             idx = self.sys_audio_combo.findData(default.name)
             if idx >= 0:
@@ -189,14 +300,53 @@ class MainWindow(QMainWindow):
             for i, d in enumerate(devices):
                 if d["max_input_channels"] > 0:
                     self.mic_combo.addItem(d["name"], userData=i)
-            # Select default input device
-            default_idx = sd.default.device[0]  # input device index
+            default_idx = sd.default.device[0]
             for combo_idx in range(self.mic_combo.count()):
                 if self.mic_combo.itemData(combo_idx) == default_idx:
                     self.mic_combo.setCurrentIndex(combo_idx)
                     break
         except Exception:
             self.mic_combo.addItem("(No microphone devices found)")
+
+    def _populate_cameras(self):
+        self.cam_combo.clear()
+        for i in range(5):
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                # Try to read the camera's friendly name via backend
+                name = f"Camera {i}"
+                cap.release()
+                self.cam_combo.addItem(name, userData=i)
+        if self.cam_combo.count() == 0:
+            self.cam_combo.addItem("(No cameras found)")
+
+    # ------------------------------------------------------------------ #
+    #  Webcam lifecycle                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _on_webcam_toggled(self, enabled):
+        self.cam_combo.setEnabled(enabled)
+        if enabled:
+            self._start_webcam()
+        else:
+            self._stop_webcam()
+
+    def _start_webcam(self):
+        self._stop_webcam()
+        cam_index = self.cam_combo.currentData()
+        if cam_index is None:
+            return
+        self._webcam_capture = WebcamCapture(device_index=cam_index)
+        self._webcam_capture.start()
+        self.webcam_overlay.place_default()
+        self.webcam_overlay.show()
+
+    def _stop_webcam(self):
+        if self._webcam_capture:
+            self._webcam_capture.stop()
+            self._webcam_capture.join(timeout=3)
+            self._webcam_capture = None
+        self.webcam_overlay.hide()
 
     # ------------------------------------------------------------------ #
     #  Idle preview                                                        #
@@ -217,15 +367,20 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # Update webcam overlay thumbnail
+        if self._webcam_capture and self.webcam_overlay.isVisible():
+            cam_frame = self._webcam_capture.get_frame()
+            if cam_frame is not None:
+                self.webcam_overlay.set_frame(cam_frame)
+
     # ------------------------------------------------------------------ #
     #  Frame display                                                       #
     # ------------------------------------------------------------------ #
 
     def _display_frame(self, frame):
-        """Convert a BGRA or BGR numpy array to QPixmap and display in preview_label."""
+        """Convert a BGRA or BGR numpy array to QPixmap and display."""
         if frame.shape[2] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-        # Scale down with cv2 (faster than Qt SmoothTransformation on full-res frames)
         h, w = frame.shape[:2]
         scale = min(PREVIEW_W / w, PREVIEW_H / h)
         new_w, new_h = int(w * scale), int(h * scale)
@@ -233,7 +388,7 @@ class MainWindow(QMainWindow):
 
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB).copy()
         qt_image = QImage(rgb.data, new_w, new_h, new_w * 3, QImage.Format.Format_RGB888)
-        qt_image = qt_image.copy()  # detach from numpy buffer
+        qt_image = qt_image.copy()
         self.preview_label.setPixmap(QPixmap.fromImage(qt_image))
 
     # ------------------------------------------------------------------ #
@@ -241,8 +396,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _on_browse_folder(self):
-        # Pause the idle preview timer while the dialog is open — mss screen
-        # captures running during a native Windows dialog can cause a crash.
         self._preview_timer.stop()
         try:
             folder = QFileDialog.getExistingDirectory(
@@ -278,7 +431,6 @@ class MainWindow(QMainWindow):
             if self.mic_check.isChecked()
             else None
         )
-        # Determine channel count for selected mic
         mic_channels = 1
         if mic_sd_index is not None:
             try:
@@ -287,6 +439,13 @@ class MainWindow(QMainWindow):
                 )
             except Exception:
                 mic_channels = 1
+
+        # Webcam settings
+        webcam_capture = None
+        webcam_pos = (0.8, 0.8)
+        if self.cam_check.isChecked() and self._webcam_capture:
+            webcam_capture = self._webcam_capture
+            webcam_pos = self.webcam_overlay.normalised_centre()
 
         self._recorder_thread = RecorderThread(
             monitor_index=monitor_idx,
@@ -297,6 +456,9 @@ class MainWindow(QMainWindow):
             record_microphone=self.mic_check.isChecked(),
             mic_device=mic_sd_index,
             mic_channels=mic_channels,
+            webcam_capture=webcam_capture,
+            webcam_pos=webcam_pos,
+            webcam_diameter_frac=0.15,
         )
         self._recorder_thread.preview_frame_ready.connect(self._on_preview_frame)
         self._recorder_thread.status_update.connect(self._on_status_update)
@@ -310,7 +472,6 @@ class MainWindow(QMainWindow):
     def _stop_recording(self):
         if self._recorder_thread:
             self._recorder_thread.stop()
-        # Disable button until thread finishes
         self.record_btn.setEnabled(False)
         self.record_btn.setText("Finishing…")
         self.record_btn.setStyleSheet("")
@@ -326,14 +487,13 @@ class MainWindow(QMainWindow):
         return True
 
     # ------------------------------------------------------------------ #
-    #  Slots (called from Qt main thread via signals)                     #
+    #  Slots                                                               #
     # ------------------------------------------------------------------ #
 
     def _on_preview_frame(self, frame):
         self._display_frame(frame)
 
     def _on_status_update(self, text):
-        # Extract "MM:SS" from "Recording... MM:SS"
         parts = text.split()
         if parts:
             self.timer_label.setText(parts[-1])
@@ -355,7 +515,6 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Recording Error", f"An error occurred:\n\n{msg}")
 
     def _on_thread_done(self):
-        # Fallback: re-enable UI if signals didn't already do it
         if not self._is_recording:
             self._set_ui_recording(False)
 
@@ -373,6 +532,8 @@ class MainWindow(QMainWindow):
             self.sys_audio_combo,
             self.mic_check,
             self.mic_combo,
+            self.cam_check,
+            self.cam_combo,
         ]
         for ctrl in controls:
             ctrl.setEnabled(not recording)
@@ -412,5 +573,6 @@ class MainWindow(QMainWindow):
                 return
             self._stop_recording()
             if self._recorder_thread:
-                self._recorder_thread.wait(10000)  # up to 10s on close
+                self._recorder_thread.wait(10000)
+        self._stop_webcam()
         event.accept()

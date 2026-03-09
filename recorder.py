@@ -1,5 +1,5 @@
 """
-recorder.py — Screen capture and audio recording threads.
+recorder.py — Screen capture, audio recording, and webcam capture threads.
 """
 
 import os
@@ -21,14 +21,50 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 
 def _get_ffmpeg_exe():
-    """Return the ffmpeg executable path, working both in development and as a PyInstaller bundle.
-
-    imageio_ffmpeg's own PyInstaller hook places the binary inside the bundle's
-    imageio_ffmpeg/binaries/ folder, and get_ffmpeg_exe() uses importlib.resources
-    to locate it — so it works correctly in frozen apps without extra handling.
-    """
+    """Return the ffmpeg executable path (works both in development and PyInstaller bundle)."""
     return imageio_ffmpeg.get_ffmpeg_exe()
 
+
+# --------------------------------------------------------------------------- #
+#  Webcam capture                                                              #
+# --------------------------------------------------------------------------- #
+
+class WebcamCapture(threading.Thread):
+    """Reads webcam frames in a background thread. Call get_frame() from any thread."""
+
+    def __init__(self, device_index=0):
+        super().__init__(daemon=True)
+        self.device_index = device_index
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._frame = None
+
+    def run(self):
+        cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        try:
+            while not self._stop_event.is_set():
+                ret, frame = cap.read()
+                if ret:
+                    with self._lock:
+                        self._frame = frame
+                else:
+                    time.sleep(0.01)
+        finally:
+            cap.release()
+
+    def get_frame(self):
+        with self._lock:
+            return self._frame.copy() if self._frame is not None else None
+
+    def stop(self):
+        self._stop_event.set()
+
+
+# --------------------------------------------------------------------------- #
+#  Audio recording                                                             #
+# --------------------------------------------------------------------------- #
 
 class AudioRecorder(threading.Thread):
     """Records audio from a loopback (system) or microphone source."""
@@ -42,6 +78,7 @@ class AudioRecorder(threading.Thread):
         self.channels = channels
         self._stop_event = threading.Event()
         self._frames = []
+        self.error = None           # Stores exception if recording fails
 
     def run(self):
         try:
@@ -49,6 +86,8 @@ class AudioRecorder(threading.Thread):
                 self._record_loopback()
             else:
                 self._record_microphone()
+        except Exception as e:
+            self.error = e
         finally:
             self._write_wav()
 
@@ -60,6 +99,16 @@ class AudioRecorder(threading.Thread):
                 self._frames.append(data.copy())
 
     def _record_microphone(self):
+        # Query actual device capabilities and use its native sample rate
+        device_info = sd.query_devices(self.device_name)
+        native_rate = int(device_info["default_samplerate"])
+        actual_channels = min(self.channels, int(device_info["max_input_channels"]))
+        if actual_channels < 1:
+            actual_channels = 1
+
+        self.sample_rate = native_rate
+        self.channels = actual_channels
+
         with sd.InputStream(
             device=self.device_name,
             samplerate=self.sample_rate,
@@ -78,7 +127,6 @@ class AudioRecorder(threading.Thread):
         if not self._frames:
             return
         data = np.concatenate(self._frames, axis=0)
-        # Clip and convert float32 → int16
         data_int16 = (data * 32767).clip(-32768, 32767).astype(np.int16)
         with wave.open(self.wav_path, "wb") as wf:
             wf.setnchannels(self.channels)
@@ -87,10 +135,14 @@ class AudioRecorder(threading.Thread):
             wf.writeframes(data_int16.tobytes())
 
 
-class RecorderThread(QThread):
-    """Captures screen frames and manages audio threads. Muxes everything into MP4 on stop."""
+# --------------------------------------------------------------------------- #
+#  Screen recording thread                                                     #
+# --------------------------------------------------------------------------- #
 
-    preview_frame_ready = pyqtSignal(object)   # carries BGR numpy array
+class RecorderThread(QThread):
+    """Captures screen frames, composites webcam, manages audio. Muxes into MP4."""
+
+    preview_frame_ready = pyqtSignal(object)   # BGR numpy array
     status_update = pyqtSignal(str)            # "Recording... MM:SS"
     recording_finished = pyqtSignal(str)       # final output file path
     error_occurred = pyqtSignal(str)           # error message
@@ -105,9 +157,12 @@ class RecorderThread(QThread):
         record_microphone,
         mic_device,
         mic_channels,
+        webcam_capture=None,
+        webcam_pos=(0.75, 0.75),
+        webcam_diameter_frac=0.15,
     ):
         super().__init__()
-        self.monitor_index = monitor_index          # 0-based (maps to sct.monitors[index+1])
+        self.monitor_index = monitor_index
         self.output_folder = output_folder
         self.fps = float(fps)
         self.record_system_audio = record_system_audio
@@ -115,6 +170,11 @@ class RecorderThread(QThread):
         self.record_microphone = record_microphone
         self.mic_device = mic_device
         self.mic_channels = mic_channels
+
+        # Webcam
+        self.webcam_capture = webcam_capture           # shared WebcamCapture instance
+        self.webcam_pos = webcam_pos                   # normalised (x, y) centre position
+        self.webcam_diameter_frac = webcam_diameter_frac  # fraction of screen height
 
         self._stop_event = threading.Event()
         self._temp_avi = os.path.join(tempfile.gettempdir(), "_screenrec_video.avi")
@@ -144,7 +204,7 @@ class RecorderThread(QThread):
                     device_name=self.mic_device,
                     wav_path=self._temp_mic_wav,
                     mode="microphone",
-                    sample_rate=44100,
+                    sample_rate=44100,       # overridden by device default in _record_microphone
                     channels=self.mic_channels,
                 )
                 self._mic_rec.start()
@@ -152,7 +212,7 @@ class RecorderThread(QThread):
             # Capture video frames
             self._capture_loop()
 
-            # Stop audio and wait for WAV files to be written
+            # Stop audio and wait for WAV files
             if self._sys_audio_rec:
                 self._sys_audio_rec.stop()
                 self._sys_audio_rec.join()
@@ -160,9 +220,23 @@ class RecorderThread(QThread):
                 self._mic_rec.stop()
                 self._mic_rec.join()
 
+            # Check for audio errors
+            errors = []
+            if self._sys_audio_rec and self._sys_audio_rec.error:
+                errors.append(f"System audio: {self._sys_audio_rec.error}")
+            if self._mic_rec and self._mic_rec.error:
+                errors.append(f"Microphone: {self._mic_rec.error}")
+
             # Mux into MP4
             final_path = self._mux_to_mp4()
-            self.recording_finished.emit(final_path)
+
+            if errors:
+                self.recording_finished.emit(final_path)
+                self.error_occurred.emit(
+                    "Recording saved but audio had issues:\n" + "\n".join(errors)
+                )
+            else:
+                self.recording_finished.emit(final_path)
 
         except Exception as e:
             self.error_occurred.emit(str(e))
@@ -171,7 +245,7 @@ class RecorderThread(QThread):
 
     def _capture_loop(self):
         frame_interval = 1.0 / self.fps
-        preview_interval = 1.0 / 10.0   # ~10 fps preview
+        preview_interval = 1.0 / 10.0
         last_preview_time = 0.0
         last_status_time = 0.0
 
@@ -194,23 +268,29 @@ class RecorderThread(QThread):
                     frame_bgra = np.array(sct_img)
                     frame_bgr = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
 
+                    # Composite webcam overlay
+                    if self.webcam_capture:
+                        cam_frame = self.webcam_capture.get_frame()
+                        if cam_frame is not None:
+                            diameter = int(h * self.webcam_diameter_frac)
+                            cx = int(self.webcam_pos[0] * w)
+                            cy = int(self.webcam_pos[1] * h)
+                            _composite_webcam(frame_bgr, cam_frame, cx, cy, diameter)
+
                     writer.write(frame_bgr)
 
                     now = time.monotonic()
 
-                    # Emit preview frame (throttled)
                     if (now - last_preview_time) >= preview_interval:
                         self.preview_frame_ready.emit(frame_bgr.copy())
                         last_preview_time = now
 
-                    # Emit status update (every second)
                     if (now - last_status_time) >= 1.0:
                         elapsed = int(now - start_time)
                         mins, secs = divmod(elapsed, 60)
                         self.status_update.emit(f"Recording... {mins:02d}:{secs:02d}")
                         last_status_time = now
 
-                    # Frame pacing
                     elapsed_loop = time.monotonic() - loop_start
                     sleep_time = frame_interval - elapsed_loop
                     if sleep_time > 0:
@@ -257,6 +337,14 @@ class RecorderThread(QThread):
             output_path,
         ]
 
+        # If no audio streams, remove codec flags for audio
+        if not has_sys and not has_mic:
+            cmd = [ffmpeg_exe, "-y", "-i", self._temp_avi,
+                   "-map", "0:v",
+                   "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                   "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                   output_path]
+
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg muxing failed:\n{result.stderr}")
@@ -270,3 +358,39 @@ class RecorderThread(QThread):
                     os.remove(path)
             except OSError:
                 pass
+
+
+# --------------------------------------------------------------------------- #
+#  Webcam compositing helper                                                   #
+# --------------------------------------------------------------------------- #
+
+def _composite_webcam(screen, cam, cx, cy, diameter):
+    """Draw a circular webcam overlay centred at (cx, cy) on *screen* (in-place)."""
+    sh, sw = screen.shape[:2]
+    ch, cw = cam.shape[:2]
+
+    # Crop webcam to square and resize
+    side = min(ch, cw)
+    y0, x0 = (ch - side) // 2, (cw - side) // 2
+    square = cam[y0:y0 + side, x0:x0 + side]
+    resized = cv2.resize(square, (diameter, diameter), interpolation=cv2.INTER_LINEAR)
+
+    # Top-left corner of the overlay
+    x1 = cx - diameter // 2
+    y1 = cy - diameter // 2
+
+    # Clamp to screen bounds
+    x1 = max(0, min(x1, sw - diameter))
+    y1 = max(0, min(y1, sh - diameter))
+
+    # Circular mask
+    mask = np.zeros((diameter, diameter), dtype=np.uint8)
+    cv2.circle(mask, (diameter // 2, diameter // 2), diameter // 2, 255, -1)
+    mask_bool = mask[:, :, np.newaxis] > 0
+
+    roi = screen[y1:y1 + diameter, x1:x1 + diameter]
+    np.copyto(roi, resized, where=mask_bool)
+
+    # White border
+    cv2.circle(screen, (x1 + diameter // 2, y1 + diameter // 2),
+               diameter // 2, (255, 255, 255), 3)
